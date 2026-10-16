@@ -4,6 +4,7 @@
     markdown-math-recovers
     markdown-math-spans
     typst-math-clear
+    typst-math-epoch
     typst-math-id-color
     typst-math-placeholder
     typst-math-render
@@ -15,6 +16,7 @@
     markdown-math-recovers
     markdown-math-spans
     typst-math-clear
+    typst-math-epoch
     typst-math-id-color
     typst-math-placeholder
     typst-math-render

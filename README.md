@@ -60,7 +60,9 @@ span as LaTeX when it contains a backslash command like `\frac`, and as typst ot
 doesn't fall back to the other syntax when a span doesn't compile. Typst buffers are always
 typst.
 
-`latex->typst` converts a single LaTeX snippet to typst source.
+`latex->typst` converts a single LaTeX snippet to typst source, as mitex emits it: the result
+calls into mitex's scope (`mitexsqrt`, `mitexarray`, ...), so evaluate it with that in scope, as
+mitex's own `mimath` does (`eval(..., scope: mitex-scope)`).
 
 ## Settings
 

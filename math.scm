@@ -28,5 +28,5 @@
                              (select ("]" (m math-next)) ("[" (m math-prev)))))
   (helix.keymaps.keymap-update-documentation!
    bindings
-   (hash "math-next" "Goto next math" "math-prev" "Goto previous math"))
+   (hash "math-next" "Goto next math block" "math-prev" "Goto previous math block"))
   (keybindings bindings))

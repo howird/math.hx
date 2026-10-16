@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, Once};
 
 use abi_stable::std_types::{RString, RVec};
@@ -32,6 +33,7 @@ fn math_module() -> FFIModule {
         .register_fn("typst-math-placeholder", typst_math_placeholder)
         .register_fn("typst-math-id-color", typst_math_id_color)
         .register_fn("typst-math-clear", typst_math_clear)
+        .register_fn("typst-math-epoch", typst_math_epoch)
         .register_fn("display-width", display_width);
 
     module
@@ -224,44 +226,11 @@ fn syntax_for(body: &str, syntax: &str) -> Result<Syntax, String> {
     }
 }
 
+/// mitex's translation of `latex`, as upstream emits it: it calls into
+/// `mitex-scope` (`mitexsqrt`, `mitexarray`, ...), so it only evaluates with
+/// that in scope.
 fn convert(latex: &str) -> Result<String, String> {
-    let typst = mitex::convert_math(latex, None)?;
-    Ok(tidy(&typst))
-}
-
-/// mitex pads every token with spaces and keeps the source's line breaks.
-/// Squash it onto one line and drop the spaces that only hurt readability,
-/// leaving string literals untouched.
-fn tidy(typst: &str) -> String {
-    let typst = typst.replace("mitexsqrt(", "sqrt(");
-    let mut out = String::with_capacity(typst.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut pending_space = false;
-    let mut prev = '\0';
-
-    for c in typst.chars() {
-        if in_string {
-            out.push(c);
-            in_string = escaped || c != '"';
-            escaped = !escaped && c == '\\';
-            prev = c;
-        } else if c.is_whitespace() {
-            pending_space = !out.is_empty();
-        } else {
-            let tight =
-                matches!(c, ')' | ']' | ',' | '_' | '^') || matches!(prev, '(' | '[' | '_' | '^');
-            if pending_space && !tight {
-                out.push(' ');
-            }
-            pending_space = false;
-            out.push(c);
-            in_string = c == '"';
-            prev = c;
-        }
-    }
-
-    out
+    mitex::convert_math(latex, None).map_err(|err| err.trim().to_string())
 }
 
 /// Convert a single LaTeX math snippet (without delimiters) to typst math.
@@ -462,7 +431,7 @@ fn math_source(body: &str, style: &MathStyle) -> Result<String, String> {
         // As mitex's own `mimath` does it: evaluate the translation with the
         // definitions it calls into in scope.
         Syntax::Latex => {
-            let typst = mitex::convert_math(body, None).map_err(|err| err.trim().to_string())?;
+            let typst = convert(body)?;
             format!(
                 "#import \"/mitex/specs/mod.typ\": mitex-scope\n\
                  #math.equation(block: {block}, eval({code:?}, scope: mitex-scope))",
@@ -557,8 +526,13 @@ static SHOWN: LazyLock<Mutex<HashMap<u64, Shown>>> = LazyLock::new(Default::defa
 /// Past this many equations, they are all dropped and re-rendered on demand.
 const MAX_SHOWN: usize = 512;
 
+/// Bumped whenever [`clear_shown`] deletes images, so callers holding an
+/// image id know to render again.
+static EPOCH: AtomicUsize = AtomicUsize::new(0);
+
 /// Forget every rendered equation and delete its image from the terminal.
 fn clear_shown(shown: &mut HashMap<u64, Shown>) {
+    EPOCH.fetch_add(1, Ordering::Relaxed);
     for (_, image) in shown.drain() {
         let _ = kitty::delete(image.id);
     }
@@ -594,20 +568,15 @@ fn show(body: &str, style: &MathStyle) -> Result<(u32, u32, u32), String> {
     let key = hasher.finish();
 
     let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
-    {
-        let mut last = LAST_LOOK.lock().unwrap_or_else(|e| e.into_inner());
-        let look = (style.fg.clone(), cell);
-        if last.as_ref().is_some_and(|last| *last != look) {
-            clear_shown(&mut shown);
-        }
-        *last = Some(look);
-    }
     if !shown.contains_key(&key) {
         // Render first: if it fails, the images already shown must stay.
         let rendered = render_math_cells(body, style, cell)?;
-        if shown.len() >= MAX_SHOWN {
+        let mut last = LAST_LOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let look = (style.fg.clone(), cell);
+        if shown.len() >= MAX_SHOWN || last.as_ref().is_some_and(|last| *last != look) {
             clear_shown(&mut shown);
         }
+        *last = Some(look);
         shown.insert(
             key,
             Shown {
@@ -700,6 +669,13 @@ fn typst_math_clear() {
     clear_shown(&mut SHOWN.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Changes whenever uploaded images are deleted (by `typst-math-clear`, a
+/// theme or font change, or the cache filling up); an id from
+/// `typst-math-render` under an older epoch may be gone.
+fn typst_math_epoch() -> usize {
+    EPOCH.load(Ordering::Relaxed)
+}
+
 pub fn build_module() -> FFIModule {
     math_module()
 }
@@ -769,12 +745,6 @@ mod tests {
         let spans = find_typst_math_spans("$ é $ $é");
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].body.as_str(), spans[0].block), ("é", true));
-    }
-
-    #[test]
-    fn tidy_ends_strings_after_escaped_backslash() {
-        assert_eq!(tidy("\"a\\\\\"  x  +  y"), "\"a\\\\\" x + y");
-        assert_eq!(tidy("\"a\\\" b\"  x"), "\"a\\\" b\" x");
     }
 
     fn style(block: bool) -> MathStyle {
@@ -907,13 +877,6 @@ mod tests {
 
     #[test]
     fn converts() {
-        println!("{:?}", convert(r"\frac{a}{b} + \sqrt{x} \cdot \mathbb{R}"));
-        println!("{:?}", convert(r"\sum_{i=1}^n \alpha_i \left( x \right)"));
-        println!(
-            "{:?}",
-            convert(r"\text{a  b} = \begin{pmatrix} 1 & 2 \\\\ 3 & 4 \end{pmatrix}")
-        );
-        assert_eq!(convert(r"\frac{a}{b}").unwrap(), "frac(a,b)");
-        assert_eq!(convert(r"\sqrt{x}_i").unwrap(), "sqrt(x)_(i)");
+        assert!(convert(r"\sqrt[3]{x}").unwrap().contains("mitexsqrt"));
     }
 }

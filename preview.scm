@@ -105,8 +105,6 @@
     (if px
         (begin
           (set! *preview-px-per-em* px)
-          ;; Same body, new size: render it again.
-          (set! *hover-rendered-body* #f)
           (schedule-sync!))
         (set-error! "math-font-size!: expected a size in pixels, or auto"))))
 
@@ -180,6 +178,16 @@
 (define (syntax-for doc-id)
   (if (equal? (editor-document->language doc-id) "markdown") (symbol->string *syntax*) "typst"))
 
+;; Everything a render of `span` depends on; it's rendered again when this
+;; changes. The epoch changes when the dylib deletes uploaded images.
+(define (render-key doc-id span)
+  (list (span-body span)
+        (span-block? span)
+        (syntax-for doc-id)
+        (text-color)
+        *preview-px-per-em*
+        (typst-math-epoch)))
+
 ;; Render `span` and upload it, returning (id cols rows) or an error string.
 (define (render-span doc-id span)
   (typst-math-render (span-body span)
@@ -238,8 +246,10 @@
 (define *hover-delim* #f)
 ;; The span's last good render, (id cols rows); kept while edits don't compile.
 (define *hover-image* #f)
-;; The body *hover-image* was rendered from, or that last failed to.
-(define *hover-rendered-body* #f)
+;; The `render-key` *hover-image* was rendered with, or that last failed to.
+(define *hover-rendered-key* #f)
+;; The last render error shown for the hovered span, so it isn't repeated.
+(define *hover-error* #f)
 ;; The reserved rows: (view-id doc-id hint-id rows), or #f.
 (define *hover-hint* #f)
 (define *hover-soft-wrap* #f)
@@ -361,15 +371,14 @@
   (set! *hover-text* #f)
   (set! *hover-delim* #f)
   (set! *hover-image* #f)
-  (set! *hover-rendered-body* #f))
+  (set! *hover-rendered-key* #f)
+  (set! *hover-error* #f))
 
-;; The hovered span again, after edits that markdown no longer reads as math
-;; (`$x $`, or a blank line inside `$$...$$`), so the image doesn't blink out
-;; while typing. It's the same span if everything up to the end of its opening
-;; delimiter and from the start of its closing one is untouched since the last
-;; sync, and (in markdown) it reads as math again once that whitespace is
-;; tidied up, so an escaped `\$` or a new code span still ends it.
-(define (sticky-span view-id doc-id pos)
+;; The hovered span followed through the edits since the last sync, without
+;; parsing the document: its end moves with the text's length, which holds
+;; while the edits stay inside it, and its delimiters must be untouched. Good
+;; enough while typing; once the edits pause, the span is checked properly.
+(define (shifted-span view-id doc-id pos)
   (let ([span *hover-span*]
         [old *hover-text*]
         [delim *hover-delim*])
@@ -380,63 +389,96 @@
          (equal? *hover-key* (list view-id doc-id (span-start span)))
          (let* ([text (editor->text doc-id)]
                 [len (text.rope-len-chars text)]
-                [old-len (text.rope-len-chars old)]
                 [start (span-start span)]
                 [old-end (span-end span)]
-                [end (+ old-end (- len old-len))]
+                [end (+ old-end (- len (text.rope-len-chars old)))]
                 [slice (lambda (rope from to) (text.rope->string (text.rope->slice rope from to)))])
            (and (<= start pos)
                 (< pos end)
                 (<= (+ start delim) (- end delim))
                 (<= end len)
-                (equal? (slice old 0 (+ start delim)) (slice text 0 (+ start delim)))
-                (equal? (slice old (- old-end delim) old-len) (slice text (- end delim) len))
-                (or (not (equal? (editor-document->language doc-id) "markdown"))
-                    (markdown-math-recovers (text.rope->string text) start end (span-block? span)))
+                (equal? (slice old start (+ start delim)) (slice text start (+ start delim)))
+                (equal? (slice old (- old-end delim) old-end) (slice text (- end delim) end))
                 (list start
                       end
                       (slice text (+ start delim) (- end delim))
                       (span-block? span)))))))
 
-;; Bring the hover in line with the primary cursor. Re-rendering waits for
-;; the edit debounce, but the span itself is always re-read, so the image
-;; follows the text while it's being typed.
+;; The hovered span again, after edits that markdown no longer reads as math
+;; (`$x $`, or a blank line inside `$$...$$`), so the image doesn't blink out
+;; while typing. It's the same span if everything up to the end of its opening
+;; delimiter and from the start of its closing one is untouched since the last
+;; sync, and (in markdown) it reads as math again once that whitespace is
+;; tidied up, so an escaped `\$` or a new code span still ends it.
+(define (sticky-span view-id doc-id pos)
+  (let ([span (shifted-span view-id doc-id pos)])
+    (and span
+         (let* ([old *hover-text*]
+                [text (editor->text doc-id)]
+                [start (span-start span)]
+                [end (span-end span)]
+                [delim *hover-delim*]
+                [slice (lambda (rope from to) (text.rope->string (text.rope->slice rope from to)))])
+           (and (equal? (slice old 0 (+ start delim)) (slice text 0 (+ start delim)))
+                (equal? (slice old (- (span-end *hover-span*) delim) (text.rope-len-chars old))
+                        (slice text (- end delim) (text.rope-len-chars text)))
+                (or (not (equal? (editor-document->language doc-id) "markdown"))
+                    (markdown-math-recovers (text.rope->string text) start end (span-block? span)))
+                span)))))
+
+;; Bring the hover in line with the primary cursor. While edits are coming
+;; in, the document isn't parsed and nothing is rendered: the hovered span is
+;; only followed through them, so the image moves with the text. Once they
+;; pause for *debounce-ms*, the span is found and rendered properly.
 (define (sync-hover!)
   (let* ([view-id (editor-focus)]
          [doc-id (editor->doc-id view-id)]
          [pos (cursor-position)]
          [auto? (auto-render? doc-id)]
          [looking? (or auto? *manual-key*)]
-         [parsed (and looking? (span-at (math-spans doc-id) pos))]
-         [found (or parsed (and looking? (sticky-span view-id doc-id pos)))]
+         [parsed (and looking? (not *edit-pending*) (span-at (math-spans doc-id) pos))]
+         [found (or parsed
+                    (and looking?
+                         (if *edit-pending*
+                             (shifted-span view-id doc-id pos)
+                             (sticky-span view-id doc-id pos))))]
          [found-key (and found (list view-id doc-id (span-start found)))]
          [shown? (or auto? (equal? found-key *manual-key*))]
          [span (and shown? found)]
          [key (and shown? found-key)])
-    (remove-orphan-hint!)
-    (unless (equal? key *manual-key*)
-      (set! *manual-key* #f))
-    (unless (equal? key *hover-key*)
-      (clear-hover!)
-      (set! *hover-key* key))
-    (when span
-      (set! *hover-span* span)
-      (set! *hover-text* (editor->text doc-id))
-      ;; `$$` around markdown display math; one `$` otherwise, typst's
-      ;; `$ ... $` included.
-      (when parsed
-        (set! *hover-delim*
-              (if (and (span-block? span) (equal? (editor-document->language doc-id) "markdown")) 2 1)))
-      (set! *hover-soft-wrap* (soft-wrap? doc-id))
-      (unless (or (equal? (span-body span) *hover-rendered-body*)
-                  (and *edit-pending* *hover-image*))
-        (set! *hover-rendered-body* (span-body span))
-        (let ([image (render-span doc-id span)])
-          (if (string? image)
-              (set-error! image)
-              (set! *hover-image* image))))
-      (sync-hint! doc-id span)
-      (ensure-hover-component!))))
+    (unless (and *edit-pending* (not span))
+      (sync-hover-to! doc-id parsed span key))))
+
+;; The rest of `sync-hover!`, once it has decided what to show.
+(define (sync-hover-to! doc-id parsed span key)
+  (remove-orphan-hint!)
+  (unless (equal? key *manual-key*)
+    (set! *manual-key* #f))
+  (unless (equal? key *hover-key*)
+    (clear-hover!)
+    (set! *hover-key* key))
+  (when span
+    (set! *hover-span* span)
+    (set! *hover-text* (editor->text doc-id))
+    ;; `$$` around markdown display math; one `$` otherwise, typst's
+    ;; `$ ... $` included.
+    (when parsed
+      (set! *hover-delim*
+            (if (and (span-block? span) (equal? (editor-document->language doc-id) "markdown")) 2 1)))
+    (set! *hover-soft-wrap* (soft-wrap? doc-id))
+    (unless (or *edit-pending* (equal? (render-key doc-id span) *hover-rendered-key*))
+      (let ([image (render-span doc-id span)])
+        ;; After rendering, which may itself delete images and change the epoch.
+        (set! *hover-rendered-key* (render-key doc-id span))
+        (if (string? image)
+            (unless (equal? image *hover-error*)
+              (set! *hover-error* image)
+              (set-error! image))
+            (begin
+              (set! *hover-error* #f)
+              (set! *hover-image* image)))))
+    (sync-hint! doc-id span)
+    (ensure-hover-component!)))
 
 ;; Keep the reserved rows matching the image, or drop them under soft-wrap or
 ;; with 'popup.
@@ -562,12 +604,15 @@
 ;; ---------------------------------------------------------------------------
 ;; `]m` / `[m`: select the next or previous span, like `]f` / `[f`.
 
+;; In select mode the selection is extended to it, with the cursor on the
+;; span's far side from the anchor, so the next `[m` starts before it.
 (define (select-span! span)
-  (let* ([primary (selection->primary-range (current-selection-object))]
-         [anchor (if (equal? (editor-mode) (string->editor-mode "select"))
-                     (range-anchor primary)
-                     (span-start span))])
-    (set-current-selection-object! (range->selection (range anchor (span-end span))))))
+  (set-current-selection-object!
+   (range->selection
+    (if (equal? (editor-mode) (string->editor-mode "select"))
+        (let ([anchor (range-anchor (selection->primary-range (current-selection-object)))])
+          (range anchor (if (< (span-start span) anchor) (span-start span) (span-end span))))
+        (range (span-start span) (span-end span))))))
 
 ;;@doc
 ;; Select the next math span.
