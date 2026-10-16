@@ -1,0 +1,9 @@
+specs/ is the typst side of mitex 0.2.4 (https://github.com/mitex-rs/mitex,
+packages/mitex/specs), copied from the typst package registry. The one change
+is in specs/latex/standard.typ, where the KaTeX logo used the `kai` symbol
+that typst has since removed; it now uses `K`.
+It is licensed under the Apache License 2.0, see LICENSE in this directory.
+
+xarrow.typ is not part of mitex: it stands in for the `@preview/xarrow:0.2.0`
+package that specs/latex/standard.typ imports, and is covered by this
+project's MIT license.

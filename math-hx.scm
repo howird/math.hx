@@ -1,0 +1,22 @@
+(#%require-dylib "libmath_hx" (only-in
+    display-width
+    latex->typst
+    markdown-math-recovers
+    markdown-math-spans
+    typst-math-clear
+    typst-math-id-color
+    typst-math-placeholder
+    typst-math-render
+    typst-math-spans
+))
+(provide 
+    display-width
+    latex->typst
+    markdown-math-recovers
+    markdown-math-spans
+    typst-math-clear
+    typst-math-id-color
+    typst-math-placeholder
+    typst-math-render
+    typst-math-spans
+)
